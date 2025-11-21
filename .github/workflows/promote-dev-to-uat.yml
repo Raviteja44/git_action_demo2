@@ -1,122 +1,150 @@
-name: "2. Promote to UAT"
+name: Promote Code Between Environments
 
 on:
   workflow_dispatch:
     inputs:
-      commit_sha:
-        description: 'Commit SHA from DEV to promote to UAT'
+      source_branch:
+        description: "Source branch (feature, dev, or uat)"
         required: true
         type: string
+      target_environment:
+        description: "Environment to promote into"
+        required: true
+        type: choice
+        options:
+          - dev
+          - uat
+          - prod
       deployment_reason:
-        description: 'Reason for promoting to UAT'
+        description: "Reason for promotion"
         required: true
         type: string
 
-# Set explicit permissions for Git operations and PR creation
 permissions:
-  contents: write        # Required to create branches and fetch commits
-  pull-requests: write   # Required to create PRs
+  contents: read
+  pull-requests: write
 
 jobs:
   promote:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Validate commit exists and is in DEV
-        id: validate-commit
+      - name: Set environment variables
         run: |
-          COMMIT_SHA="${{ github.event.inputs.commit_sha }}"
-          echo "Validating commit: $COMMIT_SHA"
+          echo "SOURCE_BRANCH=${{ github.event.inputs.source_branch }}" >> $GITHUB_ENV
+          echo "TARGET_BRANCH=${{ github.event.inputs.target_environment }}" >> $GITHUB_ENV
+        shell: bash
 
-          # Fetch DEV branch
-          git fetch origin dev
+      - name: Fetch source and target branches
+        run: |
+          set -e
 
-          # Verify commit exists
-          if ! git cat-file -e $COMMIT_SHA^{commit} 2>/dev/null; then
-            echo "❌ Error: Commit $COMMIT_SHA does not exist in repo"
-            exit 1
+          echo "Source branch: $SOURCE_BRANCH"
+          echo "Target branch: $TARGET_BRANCH"
+
+          # Handle fork format: owner:branch
+          if [[ "$SOURCE_BRANCH" == *:* ]]; then
+            OWNER="${SOURCE_BRANCH%%:*}"
+            BRANCH="${SOURCE_BRANCH#*:}"
+
+            echo "Detected fork: owner=$OWNER branch=$BRANCH"
+            REPO_NAME="${{ github.event.repository.name }}"
+
+            git remote add fork "https://github.com/$OWNER/$REPO_NAME" || true
+            git fetch fork "$BRANCH"
+            git fetch origin "$TARGET_BRANCH"
+
+            git checkout -B source-branch "fork/$BRANCH"
+          else
+            git fetch origin "$SOURCE_BRANCH"
+            git fetch origin "$TARGET_BRANCH"
+
+            git checkout -B source-branch "origin/$SOURCE_BRANCH"
           fi
 
-          # Verify commit is in DEV branch
-          if ! git merge-base --is-ancestor $COMMIT_SHA origin/dev 2>/dev/null; then
-            echo "❌ Error: Commit $COMMIT_SHA is not in DEV branch"
-            exit 1
+          git checkout -B target-branch "origin/$TARGET_BRANCH"
+        shell: bash
+
+      - name: Compare source and target branches
+        id: diff
+        run: |
+          set -e
+          CHANGED_FILES=$(git diff --name-only origin/$TARGET_BRANCH...origin/$SOURCE_BRANCH)
+
+          if [ -z "$CHANGED_FILES" ]; then
+            echo "changed_files=" >> $GITHUB_OUTPUT
+            echo "change_count=0" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-          echo "✅ Commit validated and exists in DEV"
-          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_ENV
+          {
+            echo "changed_files<<EOF"
+            printf '%s\n' "$CHANGED_FILES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
 
-      - name: Determine feature branch (optional)
-        id: determine-branch
-        run: |
-          # Attempt to find feature branch from commit
-          FEATURE_BRANCH=$(git branch -r --contains $COMMIT_SHA | grep -v "dev" | head -n1 | sed 's|origin/||')
-          if [ -z "$FEATURE_BRANCH" ]; then
-            FEATURE_BRANCH="unknown"
-          fi
-          echo "FEATURE_BRANCH=$FEATURE_BRANCH" >> $GITHUB_ENV
-          echo "Feature branch determined: $FEATURE_BRANCH"
+          COUNT=$(echo "$CHANGED_FILES" | wc -l)
+          echo "change_count=${COUNT}" >> $GITHUB_OUTPUT
+        shell: bash
 
-      - name: Create UAT branch
-        id: create-uat-branch
-        run: |
-          UAT_BRANCH="uat-${FEATURE_BRANCH//\//-}-$(date +%s)"
-          git fetch origin uat
-          git checkout -b $UAT_BRANCH origin/uat
-          echo "UAT_BRANCH=$UAT_BRANCH" >> $GITHUB_ENV
-          echo "✅ Created UAT branch: $UAT_BRANCH"
+      - name: Skip PR if no differences
+        if: ${{ steps.diff.outputs.change_count == '0' }}
+        run: echo "No differences detected — skipping PR."
 
-      - name: Merge commit into UAT branch
-        run: |
-          git merge --no-ff $COMMIT_SHA -m "Promote commit $COMMIT_SHA from DEV to UAT"
-          echo "✅ Merged commit $COMMIT_SHA into $UAT_BRANCH"
-
-      - name: Push UAT branch
-        run: |
-          git push origin $UAT_BRANCH
-          echo "✅ Pushed UAT branch to remote: $UAT_BRANCH"
-
-      - name: Create UAT PR
+      - name: Create Promotion PR
+        if: ${{ steps.diff.outputs.change_count != '0' }}
         uses: actions/github-script@v7
+        env:
+          SOURCE_BRANCH: ${{ env.SOURCE_BRANCH }}
+          TARGET_BRANCH: ${{ env.TARGET_BRANCH }}
+          DEPLOYMENT_REASON: ${{ github.event.inputs.deployment_reason }}
+          CHANGED_FILES: ${{ steps.diff.outputs.changed_files }}
+          CHANGE_COUNT: ${{ steps.diff.outputs.change_count }}
         with:
           script: |
-            const uatBranch = process.env.UAT_BRANCH;
-            const commitSha = process.env.COMMIT_SHA;
-            const deploymentReason = '${{ github.event.inputs.deployment_reason }}';
+            const source = process.env.SOURCE_BRANCH.trim();
+            const target = process.env.TARGET_BRANCH.trim();
+            const changed = process.env.CHANGED_FILES.split("\n").filter(Boolean);
+            const count = Number(process.env.CHANGE_COUNT);
 
-            const prBody = `
-            ## Promotion to UAT Environment
-            **Commit SHA:** ${commitSha}
-            **UAT Branch:** ${uatBranch}
-            **Promotion Reason:** ${deploymentReason}
+            // Check if PR already exists
+            const existing = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: source,
+              base: target,
+              state: "open"
+            });
 
-            **Verification:**
-            - Deployed to DEV
-            - Tested in DEV Environment
+            if (existing.data.length > 0) {
+              console.log("PR already exists: " + existing.data[0].html_url);
+              return;
+            }
 
-            **Approval Required:** Manager/Team Lead approval required.
-            `;
+            const body = [
+              `## Promote ${source} → ${target}`,
+              `**Reason:** ${process.env.DEPLOYMENT_REASON}`,
+              ``,
+              `### Changed files (${count})`,
+              "```",
+              ...changed,
+              "```",
+              "",
+              "**CODEOWNERS review required**"
+            ].join("\n");
 
             const { data: pr } = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `UAT: Promote commit ${commitSha}`,
-              head: uatBranch,
-              base: 'uat',
-              body: prBody
+              title: `🚀 Promote ${source} → ${target}`,
+              head: source,
+              base: target,
+              body: body
             });
 
-            console.log(`✅ Created UAT PR: ${pr.html_url}`);
-
-            // Add label for tracking
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
-              labels: ['uat-promotion']
-            });
+            console.log("PR created:", pr.html_url);
