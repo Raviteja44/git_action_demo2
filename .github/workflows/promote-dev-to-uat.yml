@@ -44,13 +44,18 @@ jobs:
         run: |
           set -e
 
-          # Handle fork: source_branch = owner:branch
+          echo "Source branch: $SOURCE_BRANCH"
+          echo "Target branch: $TARGET_BRANCH"
+
+          # Handle fork format: owner:branch
           if [[ "$SOURCE_BRANCH" == *:* ]]; then
             OWNER="${SOURCE_BRANCH%%:*}"
             BRANCH="${SOURCE_BRANCH#*:}"
-            echo "Using fork branch: owner=$OWNER branch=$BRANCH"
 
-            git remote add fork "https://github.com/$OWNER/${{ github.repository#*/ }}" || true
+            echo "Detected fork: owner=$OWNER branch=$BRANCH"
+            REPO_NAME="${{ github.event.repository.name }}"
+
+            git remote add fork "https://github.com/$OWNER/$REPO_NAME" || true
             git fetch fork "$BRANCH"
             git fetch origin "$TARGET_BRANCH"
 
@@ -69,7 +74,6 @@ jobs:
         id: diff
         run: |
           set -e
-
           CHANGED_FILES=$(git diff --name-only origin/$TARGET_BRANCH...origin/$SOURCE_BRANCH)
 
           if [ -z "$CHANGED_FILES" ]; then
@@ -90,7 +94,7 @@ jobs:
 
       - name: Skip PR if no differences
         if: ${{ steps.diff.outputs.change_count == '0' }}
-        run: echo "No differences ― skipping PR creation."
+        run: echo "No differences detected — skipping PR."
 
       - name: Create Promotion PR
         if: ${{ steps.diff.outputs.change_count != '0' }}
@@ -140,7 +144,7 @@ jobs:
               title: `🚀 Promote ${source} → ${target}`,
               head: source,
               base: target,
-              body
+              body: body
             });
 
-            console.log("Created PR:", pr.html_url);
+            console.log("PR created:", pr.html_url);
